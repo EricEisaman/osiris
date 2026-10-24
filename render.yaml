@@ -1,0 +1,37 @@
+
+services:
+  - type: web
+    name: osiris
+    runtime: node
+    plan: free
+    region: ohio
+    branch: master
+    buildCommand: "npm ci --include=dev && npm run build"
+    startCommand: "npm start -- -H 0.0.0.0 -p $PORT"
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: NODE_VERSION
+        value: "22.14.0"
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"
+      - key: HOSTNAME
+        value: "0.0.0.0"
+      - key: NODE_ENV
+        value: production
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=512"
+      - key: FIRMS_API_KEY
+        sync: false
+      - key: OPENSKY_CLIENT_ID
+        sync: false
+      - key: OPENSKY_CLIENT_SECRET
+        sync: false
+      - key: N2YO_API_KEY
+        sync: false
+      - key: AIS_API_KEY
+        sync: false
+      - key: SCANNER_URL
+        sync: false
+      - key: SCANNER_KEY
+        sync: false
