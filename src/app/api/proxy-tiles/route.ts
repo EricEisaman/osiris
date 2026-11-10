@@ -35,7 +35,24 @@ export async function GET(request: NextRequest) {
     });
 
     if (!response.ok) {
-      return NextResponse.json({ error: 'Failed to fetch tile' }, { status: response.status });
+      const upstreamBody = await response.text();
+
+      console.error(
+        '[proxy-tiles] upstream failure',
+        JSON.stringify({
+          url: targetUrl.toString(),
+          status: response.status,
+          statusText: response.statusText,
+          contentType: response.headers.get('content-type'),
+          server: response.headers.get('server'),
+          body: upstreamBody.slice(0, 2000),
+        })
+      );
+
+      return NextResponse.json(
+        { error: 'Failed to fetch tile' },
+        { status: response.status }
+      );
     }
 
     const data = await response.arrayBuffer();
