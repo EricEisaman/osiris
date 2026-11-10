@@ -8,10 +8,11 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    /* Only CARTO's basemap hosts, over https on the default port: the style,
-       tiles, sprite and fonts all live there, and the map needs nothing else
-       from cartocdn.com. No basemap URL has a query string, so it is dropped,
-       which keeps one stored copy per tile in the year-long fetch cache. */
+    /*
+    * Only allow CARTO basemap hosts over HTTPS on the default port.
+    * Discard incoming query parameters and fragments, then inject
+    * our server-side CARTO Basemaps API key.
+    */
     const targetUrl = new URL(url);
     const host = targetUrl.hostname.toLowerCase();
     if (
@@ -22,6 +23,19 @@ export async function GET(request: NextRequest) {
     }
     targetUrl.search = '';
     targetUrl.hash = '';
+
+    const cartoKey = process.env.CARTO_BASEMAPS_API_KEY?.trim();
+
+    if (!cartoKey) {
+      console.error('[proxy-tiles] CARTO_BASEMAPS_API_KEY is not configured');
+
+      return NextResponse.json(
+        { error: 'Basemap API key is not configured' },
+        { status: 500 }
+      );
+    }
+
+    targetUrl.searchParams.set('key', cartoKey);
 
     const response = await fetch(targetUrl.toString(), { signal: AbortSignal.timeout(15000),
       headers: {
@@ -40,7 +54,7 @@ export async function GET(request: NextRequest) {
       console.error(
         '[proxy-tiles] upstream failure',
         JSON.stringify({
-          url: targetUrl.toString(),
+          url: `${targetUrl.origin}${targetUrl.pathname}`,
           status: response.status,
           statusText: response.statusText,
           contentType: response.headers.get('content-type'),
