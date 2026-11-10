@@ -39,7 +39,14 @@ const nextConfig: NextConfig = {
   /* No images.remotePatterns: nothing renders next/image, and the old
      `hostname: '**'` let anyone use /_next/image to fetch and resize pictures
      from any host through this server. A remote image source added later
-     should be listed by exact host. */
+     should be listed by exact host.
+     `unoptimized` goes one step further and switches the optimizer off, so
+     /_next/image answers 404 before it fetches or decodes anything. Nothing
+     here needs resized images, and the optimizer is where most of Next's
+     recent advisories have been. */
+  images: {
+    unoptimized: true,
+  },
   async headers() {
     return [
       /* The worker path carries the MapLibre version, so a given URL never
@@ -58,6 +65,15 @@ const nextConfig: NextConfig = {
         source: '/vendor/yolox/:version/:file*',
         headers: [
           { key: 'Cache-Control', value: 'public, max-age=31536000, immutable' },
+        ],
+      },
+      /* The built-in place list (lib/places.ts): over a megabyte, and it only
+         changes when tools/build-places.mjs is run again, so a browser keeps
+         it for a day rather than asking again on every page load. */
+      {
+        source: '/places.json',
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=86400, stale-while-revalidate=604800' },
         ],
       },
       {

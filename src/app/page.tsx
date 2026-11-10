@@ -3,7 +3,7 @@
 import { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo } from 'react';
 import dynamic from 'next/dynamic';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Layers, BarChart3, Newspaper, Search, X, Globe, MapPinned, Route, Radar, Satellite, Moon, ExternalLink, AlertTriangle, Activity, Database, Wifi, Play, Network, Crosshair, Bluetooth, Pentagon, Radio , PenLine, Orbit } from 'lucide-react';
+import { Layers, BarChart3, Newspaper, Search, X, Globe, MapPinned, Route, Radar, Satellite, Moon, ExternalLink, AlertTriangle, Activity, Database, Wifi, Play, Network, Crosshair, Bluetooth, Pentagon, Radio , PenLine, Orbit, Mountain } from 'lucide-react';
 import { type TerrainStatus } from '@/lib/map-terrain';
 import { loadCameraCatalog, mergeCameraCatalog } from '@/lib/camera-catalog';
 import IntelFeed from '@/components/IntelFeed';
@@ -34,13 +34,16 @@ const OsintPanel = dynamic(() => import('@/components/OsintPanel'));
 const OiPanel = dynamic(() => import('@/components/OiPanel'));
 const DrawingToolbar = dynamic(() => import('@/components/DrawingToolbar'), { ssr: false });
 const DrawHud = dynamic(() => import('@/components/DrawHud'), { ssr: false });
+const FieldView3D = dynamic(() => import('@/components/lidar/FieldView3D'), { ssr: false });
+/** What the on-map drawing guide calls a shape a terrain tool asked for. */
+const LIDAR_DRAW_TITLE: Record<LidarPurpose, string> = { field: 'FIELD', profile: 'PROFILE', split: 'SPLIT LINE', cutout: 'CUT OUT' };
 // The measurement helpers are pure functions — importing them directly keeps
 // them out of the lazy chunk, so a finished polygon can be measured whether or
 // not the toolbar has loaded yet.
 import { toShape, queryRing, type DrawMode, type DrawnShape, type DrawProgress, type DrawResult } from '@/lib/draw';
 import { selectInPolygon } from '@/lib/aoi';
 import { pickLandingCity } from '@/lib/landing-cities';
-import { searchPlaces } from '@/lib/geosearch';
+import { placeAt, searchPlaces } from '@/lib/geosearch';
 import { diffSweep, appendEvents, type WatchBaseline, type WatchEvent } from '@/lib/watch';
 import { STORAGE_KEY, serializeShapes, deserializeShapes, shapesToGeoJSON, downloadFile } from '@/lib/aoi-export';
 const TokenPanel = dynamic(() => import('@/components/TokenPanel'));
@@ -56,6 +59,10 @@ import { searchObjects, TYPE_LABEL, objectsOf } from '@/lib/oi/objects';
 import { workspaceInsets } from '@/lib/oi/layout';
 import type { OiGlobe, OiHover } from '@/lib/oi/globe';
 import { look } from '@/lib/vision/store';
+import { useLidar, lidarStore, completeDraw as lidarCompleteDraw, cancelDraw as lidarCancelDraw, setCursor as lidarCursor, setTab as setLidarTab, setRelief as setLidarRelief, analyseArea, profileAlong, open3dWithRain, clearField as clearLidarField, clearProfile as clearLidarProfile, makeCutout as lidarMakeCutout, type DrawPurpose as LidarPurpose } from '@/lib/lidar/store';
+import { boxAround, boxProblem, cutoutPath, describeBox, openCutoutTab, type LngLatBox } from '@/lib/cutout';
+import { describeFlight, lidarFlightAt } from '@/lib/lidar/usgs';
+import type { TerrainBridge } from '@/lib/oi/assist/tools';
 function useIsMobile() {
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
@@ -227,6 +234,31 @@ export default function Dashboard() {
   const [showDrawing, setShowDrawing] = useState(false);
   const [drawMode, setDrawMode] = useState<DrawMode | null>(null);
   const [drawProgress, setDrawProgress] = useState<DrawProgress | null>(null);
+  // The ArcGIS panel's terrain tools borrow the map's draw interaction.
+  const lidar = useLidar();
+  useEffect(() => {
+    let armed = lidarStore.get().drawing;
+    return lidarStore.subscribe(() => {
+      const want = lidarStore.get().drawing;
+      if (want === armed) return;
+      armed = want;
+      if (!want) return;
+      setDrawMode(want === 'field' ? 'polygon' : want === 'cutout' ? 'rectangle' : 'line');
+      setDrawProgress(null);
+    });
+  }, []);
+  /* Drawing tools can lift any box or shape out of the map into a cut-out: its
+     own tab, in 3D, with the cameras and network hosts inside it. */
+  const [cutoutArmed, setCutoutArmed] = useState(false);
+  const cutoutArmedRef = useRef(false);
+  const armCutout = useCallback((on: boolean) => { cutoutArmedRef.current = on; setCutoutArmed(on); }, []);
+  const [cutoutNote, setCutoutNote] = useState<{ text: string; path?: string; error?: boolean } | null>(null);
+  const cutOutBox = useCallback((box: LngLatBox) => {
+    const problem = boxProblem(box);
+    if (problem) { setCutoutNote({ text: problem, error: true }); return; }
+    const opened = openCutoutTab(box);
+    setCutoutNote({ text: opened ? `Opened the ${describeBox(box)} cut-out in a new tab.` : 'Your browser held the new tab back.', path: cutoutPath(box) });
+  }, []);
   const [drawCommand, setDrawCommand] = useState<{ action: 'undo' | 'finish' | 'cancel'; seq: number } | null>(null);
   const sendDraw = useCallback((action: 'undo' | 'finish' | 'cancel') => {
     setDrawCommand(c => ({ action, seq: (c?.seq ?? 0) + 1 }));
@@ -550,6 +582,7 @@ export default function Dashboard() {
     else if (panel === 'intel') { if (phone) setMobilePanel('recon'); else right(() => setShowIntel(true)); }
     else if (panel === 'layers') { if (phone) setMobilePanel('layers'); else setShowLayers(true); }
     else if (panel === 'directions') setShowDirections(true);
+    else if (panel === 'terrain') { setLidarTab('terrain'); setShowArcGIS(true); }
     else if (panel === 'forecast' || panel === 'workspace') {
       setOiMode('forecast');
       if (phone) setMobilePanel('oi'); else setShowOi(true);
@@ -560,7 +593,23 @@ export default function Dashboard() {
   const assistStage = useRef<Stage>(oiStage);
   useEffect(() => { assistTheater.current = oiTheater; }, [oiTheater]);
   useEffect(() => { assistStage.current = oiStage; }, [oiStage]);
+  // OI drives the ArcGIS panel's terrain tools through the same store the panel uses.
+  const terrainBridge = useMemo<TerrainBridge>(() => ({
+    relief: ({ mode, opacity, off }) => {
+      if (off) { setLidarRelief({ opacity: 0 }); return 'Lidar relief off'; }
+      const cur = lidarStore.get().relief;
+      setLidarRelief({ ...(mode ? { mode } : {}), opacity: opacity ?? (cur.opacity || 0.75) });
+      return `Lidar relief on: ${mode ?? cur.mode}, ${Math.round((opacity ?? (cur.opacity || 0.75)) * 100)}% (shows from about zoom 8)`;
+    },
+    profile: line => profileAlong(line),
+    field: (ring, analysis, ratio) => analyseArea(ring, analysis, ratio),
+    coverage: async (lat, lng) => { const f = await lidarFlightAt(lng, lat); return f ? `${describeFlight(f)}, project ${f.project}${f.gsdM ? `, ${f.gsdM} m DEM` : ''}` : null; },
+    rain3d: () => { if (lidarStore.get().field?.status !== 'ready') return false; open3dWithRain(); return true; },
+    cutout: (box, water) => { const c = lidarMakeCutout(box, true, water ?? null); return { path: c.path, label: c.label, opened: c.opened, error: c.error }; },
+    clear: () => { clearLidarField(); clearLidarProfile(); setLidarRelief({ opacity: 0 }); },
+  }), []);
   const assistSite = useMemo<Omit<Site, 'forecast'>>(() => ({
+    terrain: terrainBridge,
     data: () => dataRef.current,
     view: () => assistView.current,
     layers: () => assistLayers.current,
@@ -610,7 +659,7 @@ export default function Dashboard() {
       const out = await look(cam, { watch, by: 'oi' });
       return { analysis: out.analysis, watch: out.watch };
     },
-  }), [openFromAssist]);
+  }), [openFromAssist, terrainBridge]);
   const assist = useAssist({
     site: assistSite,
     startForecast: async (question, depth, auth) => {
@@ -842,6 +891,7 @@ export default function Dashboard() {
   // Mouse coords + reverse geocode (Zero-Render)
   const handleMouseCoords = useCallback((coords: { lat: number; lng: number }) => {
     mouseCoordsRef.current = coords;
+    lidarCursor(coords.lng, coords.lat);
     if (coordsDisplayRef.current) {
       coordsDisplayRef.current.innerText = `${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)}`;
     }
@@ -853,19 +903,14 @@ export default function Dashboard() {
       }
       const gk = `${coords.lat.toFixed(1)},${coords.lng.toFixed(1)}`; // coarser grid = more cache hits
       if (geocodeCache.current.has(gk)) { setLocationLabel(geocodeCache.current.get(gk)!); lastGeocodedPos.current = coords; return; }
+      /* Named from the built-in place list, in the browser: nothing is asked
+         of any outside service (see lib/geosearch.ts). Open sea has no name. */
       try {
-        /* Our own route, not Nominatim directly: it rounds the coordinate,
-           caches the answer for everyone, and holds the app's request budget
-           for the service — see lib/nominatim.ts. */
-        const res = await fetch(`/api/geo/reverse?lat=${coords.lat}&lng=${coords.lng}`);
-        if (res.ok) {
-          const d = await res.json();
-          const label = d.label || 'Unknown';
-          if (geocodeCache.current.size > 500) { const it = geocodeCache.current.keys(); for (let i=0;i<100;i++) { const k = it.next().value; if(k) geocodeCache.current.delete(k); }}
-          geocodeCache.current.set(gk, label);
-          setLocationLabel(label);
-          lastGeocodedPos.current = coords;
-        }
+        const label = (await placeAt(coords.lat, coords.lng))?.label ?? '';
+        if (geocodeCache.current.size > 500) { const it = geocodeCache.current.keys(); for (let i=0;i<100;i++) { const k = it.next().value; if(k) geocodeCache.current.delete(k); }}
+        geocodeCache.current.set(gk, label);
+        setLocationLabel(label);
+        lastGeocodedPos.current = coords;
       } catch (e) { console.warn('[OSIRIS] Suppressed error:', e instanceof Error ? e.message : e); }
     }, 3000); // 3s debounce (was 1.5s)
   }, []);
@@ -941,7 +986,18 @@ export default function Dashboard() {
   }, []);
 
   const handleDrawComplete = useCallback((result: DrawResult) => {
+    if (lidarStore.get().drawing) {
+      lidarCompleteDraw(result);
+      setDrawMode(null);
+      setDrawProgress(null);
+      return;
+    }
     setDrawnPolygons(prev => [toShape(result, prev, prev.length), ...prev]);
+    if (cutoutArmedRef.current) {
+      cutoutArmedRef.current = false;
+      setCutoutArmed(false);
+      cutOutBox(boxAround(result.coords as [number, number][]));
+    }
     // One shape per arming: staying armed after a finish is how you end up
     // with an accidental second AOI from the click that dismisses the first.
     setDrawMode(null);
@@ -1207,7 +1263,7 @@ export default function Dashboard() {
   }, [activeLayers, fetchEndpoint]);
 
   /* ── LIVE MALWARE — pushed over SSE while the layer is on ──
-     Detections arrive when URLhaus reports them rather than on a timer, so
+     Detections arrive when the C2 feeds list them rather than on a timer, so
      there is no poll interval to tune and no request that re-downloads the
      same rows to discover nothing changed. The connection also carries the
      progressive geolocation fill, which is why a cold server paints the map in
@@ -1237,8 +1293,8 @@ export default function Dashboard() {
           for (const d of event.detections) byIp.set(d.ip, d);
           commit();
         } else if (event.type === 'detections') {
-          // Only a first sighting is an arrival. An existing host that served
-          // another payload arrives with fresh:false and keeps whatever beacon
+          // Only a first sighting is an arrival. An existing host that was
+          // listed again arrives with fresh:false and keeps whatever beacon
           // state it already had, so it does not re-flag itself as new.
           const beacon = filled && event.fresh;
           for (const d of event.detections) {
@@ -1570,6 +1626,7 @@ export default function Dashboard() {
           mapStyle={mapStyle === 'satellite' ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}' : 'dark'} 
           onEntityClick={handleEntityClick} 
           onMouseCoords={handleMouseCoords} 
+          lidar={lidar.overlay}
           onRightClick={handleRightClick} 
           onViewStateChange={setMapView}
           onReady={() => setMapReady(true)}
@@ -1594,7 +1651,7 @@ export default function Dashboard() {
           drawMode={drawMode}
           onDrawProgress={setDrawProgress}
           drawCommand={drawCommand}
-          onDrawCancel={() => { setDrawMode(null); setDrawProgress(null); }}
+          onDrawCancel={() => { lidarCancelDraw(); armCutout(false); setDrawMode(null); setDrawProgress(null); }}
           onDrawComplete={handleDrawComplete}
           drawnPolygons={drawnPolygons}
           aircraftAirports={aircraftAirports}
@@ -1973,9 +2030,9 @@ export default function Dashboard() {
 
         {/* ── ARCGIS INTEL ── */}
         <div className="relative group">
-          <button onClick={() => { setShowArcGIS(!showArcGIS); setShowRemote(false); }} className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-white/50 ${showArcGIS ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`} title="ArcGIS — search & import geospatial intel layers" aria-label="ArcGIS" aria-expanded={showArcGIS}>
-            <Database className={`w-4 h-4 ${showArcGIS ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
-            {showArcGIS && (
+          <button onClick={() => { const open = !(showArcGIS && lidar.tab === 'layers'); setLidarTab('layers'); setShowArcGIS(open); setShowRemote(false); }} className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-white/50 ${showArcGIS && lidar.tab === 'layers' ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`} title="ArcGIS — search & import geospatial intel layers" aria-label="ArcGIS" aria-expanded={showArcGIS && lidar.tab === 'layers'}>
+            <Database className={`w-4 h-4 ${showArcGIS && lidar.tab === 'layers' ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
+            {showArcGIS && lidar.tab === 'layers' && (
               <span
                 aria-hidden="true"
                 className="absolute -right-1 top-1/2 -translate-y-1/2 h-4 w-[2px] rounded-full bg-current text-[var(--gold-primary)]"
@@ -1994,6 +2051,8 @@ export default function Dashboard() {
                     onUpdateLayer={(id, updates) => setArcgisLayers(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l))}
                     importedLayers={arcgisLayers}
                     mapBounds={mapCenter?.bounds || null}
+                    onSatellite={() => setMapStyle('satellite')}
+                    onFlyTo={(lat, lng, zoom) => setFlyToLocation({ lat, lng, zoom, ts: Date.now() })}
                   />
                 </div>
               </motion.div>
@@ -2001,6 +2060,20 @@ export default function Dashboard() {
           </AnimatePresence>
         </div>
 
+
+        {/* ── TERRAIN ── The ArcGIS panel's terrain tools, one click away. */}
+        <div className="relative group">
+          <button onClick={() => { const open = !(showArcGIS && lidar.tab === 'terrain'); setLidarTab('terrain'); setShowArcGIS(open); setShowRemote(false); }} className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-white/50 ${showArcGIS && lidar.tab === 'terrain' ? 'bg-[var(--gold-primary)]/20' : 'hover:bg-white/10'}`} title="Terrain — lidar relief, profiles, field drainage, cut / fill, and cut-outs of the map in 3D" aria-label="Terrain" aria-expanded={showArcGIS && lidar.tab === 'terrain'}>
+            <Mountain className={`w-4 h-4 ${showArcGIS && lidar.tab === 'terrain' ? 'text-[var(--gold-primary)]' : 'text-white/60'}`} />
+            {showArcGIS && lidar.tab === 'terrain' && (
+              <span
+                aria-hidden="true"
+                className="absolute -right-1 top-1/2 -translate-y-1/2 h-4 w-[2px] rounded-full bg-current text-[var(--gold-primary)]"
+              />
+            )}
+          </button>
+          <span className="absolute right-11 top-1/2 -translate-y-1/2 px-2 py-1 text-[9px] font-mono tracking-wider text-white/80 bg-black/80 backdrop-blur-sm rounded whitespace-nowrap opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity pointer-events-none">TERRAIN</span>
+        </div>
 
         {/* Separator */}
         <div className="w-4 h-px bg-white/10 mx-auto" />
@@ -2308,6 +2381,9 @@ export default function Dashboard() {
         </motion.div>
       )}
 
+      {/* ── Field in 3D (ArcGIS panel terrain tools) ── */}
+      {lidar.view3d && <FieldView3D />}
+
       {/* ── Camera Viewer ── */}
       <CameraViewer
         camera={activeCamera}
@@ -2321,10 +2397,11 @@ export default function Dashboard() {
       {drawMode && (
         <DrawHud
           mode={drawMode}
+          title={cutoutArmed ? 'CUT OUT' : lidar.drawing ? LIDAR_DRAW_TITLE[lidar.drawing] : undefined}
           progress={drawProgress}
           onUndo={() => sendDraw('undo')}
           onFinish={() => sendDraw('finish')}
-          onCancel={() => { sendDraw('cancel'); setDrawMode(null); setDrawProgress(null); }}
+          onCancel={() => { sendDraw('cancel'); lidarCancelDraw(); armCutout(false); setDrawMode(null); setDrawProgress(null); }}
         />
       )}
 
@@ -2332,7 +2409,11 @@ export default function Dashboard() {
         <div className="absolute right-12 top-1/2 -translate-y-1/2 z-[400] w-80 pointer-events-auto">
           <DrawingToolbar
             drawMode={drawMode}
-            onSetDrawMode={setDrawMode}
+            onSetDrawMode={(m) => { lidarCancelDraw(); armCutout(false); setDrawMode(m); }}
+            cutoutArmed={cutoutArmed}
+            onArmCutout={(on) => { lidarCancelDraw(); setCutoutNote(null); setDrawMode(on ? 'rectangle' : null); armCutout(on); }}
+            onCutOut={cutOutBox}
+            cutoutNote={cutoutNote}
             progress={drawProgress}
             polygons={drawnPolygons}
             onDeletePolygon={(id) => setDrawnPolygons(p => p.filter(x => x.id !== id))}

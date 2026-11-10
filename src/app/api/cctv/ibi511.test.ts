@@ -4,6 +4,7 @@ import { fetchFloridaCameras } from './florida';
 import { fetchGeorgiaCameras } from './georgia';
 import { fetchNorthCarolinaCameras } from './northcarolina';
 import { fetchArizonaCameras } from './arizona';
+import { fetchIdahoCameras } from './idaho';
 import { fetchOntarioCameras } from './ontario';
 import { fetchAlbertaCameras } from './alberta';
 
@@ -180,6 +181,19 @@ describe('mapIbi511Record', () => {
     expect(mapIbi511Record(sample, FDOT)?.id).toBe('fdot-1');
   });
 
+  it('leaves out the agencies a deployment names', () => {
+    const cfg = { ...FDOT, excludeAgencies: ['UDOT', 'ODOT'] };
+    expect(mapIbi511Record({ ...sample, source: 'UDOT' }, cfg)).toBeNull();
+    expect(mapIbi511Record({ ...sample, source: 'ODOT' }, cfg)).toBeNull();
+    expect(mapIbi511Record({ ...sample, source: 'FDOT' }, cfg)?.id).toBe('fdot-1');
+    expect(mapIbi511Record({ ...sample, source: null }, cfg)?.id).toBe('fdot-1');
+  });
+
+  it('captions from the state when the county column is not to be trusted', () => {
+    expect(mapIbi511Record(sample, { ...FDOT, ignoreCounty: true })?.city).toBe('Florida');
+    expect(mapIbi511Record({ ...sample, city: 'Cocoa' }, { ...FDOT, ignoreCounty: true })?.city).toBe('Cocoa');
+  });
+
   it('places a Canadian deployment in Canada', () => {
     /** A row from 511on.ca/List/GetData/Cameras. */
     const qew: Ibi511Record = {
@@ -231,6 +245,30 @@ describe('loadIbi511Cameras', () => {
     ]);
     expect(cams).toHaveLength(120);
   });
+
+  const pagedFeed = (total: number, rowFor: (id: number) => Ibi511Record, failFrom = Infinity) =>
+    vi.fn(async (input: RequestInfo | URL) => {
+      const query = JSON.parse(new URL(String(input)).searchParams.get('query') ?? '{}');
+      if (query.start >= failFrom) return new Response('', { status: 503 });
+      const rows = Array.from({ length: Math.max(0, Math.min(query.length, total - query.start)) }, (_, i) => rowFor(query.start + i + 1));
+      return Response.json({ recordsTotal: total, data: rows });
+    });
+
+  /* Idaho leaves out a tenth of its rows on purpose; that must not read as
+     pages lost to throttling. */
+  it('does not count rows left out on purpose as a short read', async () => {
+    vi.stubGlobal('fetch', pagedFeed(200, id => ({ ...sample, id, source: id % 5 === 0 ? 'UDOT' : 'FDOT' })));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const cams = await loadIbi511Cameras({ ...FDOT, excludeAgencies: ['UDOT'] });
+    expect(cams).toHaveLength(160);
+  });
+
+  it('still refuses a read that lost pages', async () => {
+    vi.stubGlobal('fetch', pagedFeed(300, id => ({ ...sample, id }), 100));
+
+    await expect(loadIbi511Cameras(FDOT)).rejects.toThrow('FDOT short read: 100 of 300');
+  });
 });
 
 describe('parseWkt', () => {
@@ -252,6 +290,7 @@ describe('live IBI 511 feeds', () => {
     ['Georgia', fetchGeorgiaCameras, 2500, { minLat: 30.3, maxLat: 35.1, minLng: -85.7, maxLng: -80.8 }],
     ['North Carolina', fetchNorthCarolinaCameras, 800, { minLat: 33.8, maxLat: 36.6, minLng: -84.4, maxLng: -75.4 }],
     ['Arizona', fetchArizonaCameras, 400, { minLat: 31.3, maxLat: 37.1, minLng: -115.0, maxLng: -109.0 }],
+    ['Idaho', fetchIdahoCameras, 300, { minLat: 41.98, maxLat: 49.01, minLng: -117.25, maxLng: -111.0 }],
     ['Ontario', fetchOntarioCameras, 700, MTO.bounds],
     ['Alberta', fetchAlbertaCameras, 250, { minLat: 48.9, maxLat: 60.1, minLng: -120.1, maxLng: -109.9 }],
   ];
